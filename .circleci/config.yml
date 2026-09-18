@@ -252,4 +252,6 @@ workflows:
       - signlink-build23-macos:
           filters:
             branches:
-              only: fix/build23-legal-back-navigation
+              only:
+                - fix/build23-legal-back-navigation
+                - ci/build23-circleci-trigger
