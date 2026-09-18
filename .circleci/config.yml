@@ -84,7 +84,172 @@ jobs:
               }
             fi
 
+  signlink-build23-macos:
+    macos:
+      xcode: "26.6"
+    resource_class: m4pro.medium
+    environment:
+      SIGNLINK_BUILD23_SHA: "3f5bf59a58f8125aa38cb6d9f132fca5426e6f06"
+      SIGNLINK_MARKETING_VERSION: "1.0.1"
+      SIGNLINK_BUILD_NUMBER: "23"
+      SIGNLINK_TEAM_ID: "TGBNH8WJV6"
+      SIGNLINK_BUNDLE_ID: "jp.signlink.app"
+    steps:
+      - checkout
+
+      - run:
+          name: Verify exact Build 23 source
+          command: |
+            set -euo pipefail
+            actual="$(git rev-parse HEAD)"
+            test "$actual" = "$SIGNLINK_BUILD23_SHA" || {
+              echo "STOP: Build 23 must use exact PR #123 head $SIGNLINK_BUILD23_SHA; got $actual"
+              exit 1
+            }
+            git diff --check
+            test -z "$(git status --porcelain)"
+
+      - run:
+          name: Verify Xcode 26.6
+          command: |
+            set -euo pipefail
+            xcodebuild -version
+            xcodebuild -showsdks
+            xcodebuild -version | grep -qx 'Xcode 26.6'
+
+      - run:
+          name: Install Bun 1.4.2
+          command: |
+            set -euo pipefail
+            curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
+            echo 'export BUN_INSTALL="$HOME/.bun"' >> "$BASH_ENV"
+            echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> "$BASH_ENV"
+            source "$BASH_ENV"
+            bun --version | grep -qx '1.4.2'
+
+      - run:
+          name: Locked install and Build 23 regression gate
+          command: |
+            set -euo pipefail
+            bun install --frozen-lockfile
+            bun run check:env-contract
+            bun x tsc --noEmit
+            bun run test
+            bun run build
+            bun run check:ios-config
+          no_output_timeout: 30m
+
+      - run:
+          name: Sync exact Build 23 source to iOS
+          command: |
+            set -euo pipefail
+            RELEASE_CHANNEL=release bun run check:release-source
+            VITE_SIGNLINK_APP_VERSION="$SIGNLINK_MARKETING_VERSION" VITE_SIGNLINK_BUILD_NUMBER="$SIGNLINK_BUILD_NUMBER" RELEASE_CHANNEL=release bun run sync:ios:independent
+            RELEASE_CHANNEL=release bun run check:release-provenance
+            bun run check:ios-config
+          no_output_timeout: 20m
+
+      - run:
+          name: Xcode Release compile without signing
+          command: |
+            set -euo pipefail
+            mkdir -p circleci-artifacts
+            xcodebuild \
+              -project ios/App/App.xcodeproj \
+              -scheme App \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CURRENT_PROJECT_VERSION="$SIGNLINK_BUILD_NUMBER" \
+              MARKETING_VERSION="$SIGNLINK_MARKETING_VERSION" \
+              build | tee circleci-artifacts/xcode-build23-compile.log
+          no_output_timeout: 30m
+
+      - run:
+          name: Generate signed Build 23 IPA when Apple credentials are configured
+          command: |
+            set -euo pipefail
+            mkdir -p circleci-artifacts
+            if [ -z "${ASC_ADMIN_AB_KEY_ID:-}" ] || [ -z "${ASC_ADMIN_AB_ISSUER_ID:-}" ] || [ -z "${ASC_ADMIN_AB_KEY_P8_BASE64:-}" ]; then
+              echo "CircleCI Apple credentials are not configured; signed IPA generation skipped after successful Xcode compile."
+              exit 0
+            fi
+
+            KEY_DIR="$(mktemp -d)"
+            KEY_PATH="$KEY_DIR/AuthKey_${ASC_ADMIN_AB_KEY_ID}.p8"
+            ARCHIVE_PATH="$PWD/circleci-artifacts/SignLink-Build23.xcarchive"
+            EXPORT_DIR="$PWD/circleci-artifacts/export"
+            EXPORT_PLIST="$PWD/circleci-artifacts/ExportOptions.plist"
+            cleanup() { rm -rf "$KEY_DIR"; }
+            trap cleanup EXIT
+            printf '%s' "$ASC_ADMIN_AB_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+            chmod 600 "$KEY_PATH"
+
+            xcodebuild archive \
+              -project ios/App/App.xcodeproj \
+              -scheme App \
+              -configuration Release \
+              -destination 'generic/platform=iOS' \
+              -archivePath "$ARCHIVE_PATH" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$KEY_PATH" \
+              -authenticationKeyID "$ASC_ADMIN_AB_KEY_ID" \
+              -authenticationKeyIssuerID "$ASC_ADMIN_AB_ISSUER_ID" \
+              DEVELOPMENT_TEAM="$SIGNLINK_TEAM_ID" \
+              CODE_SIGN_STYLE=Automatic \
+              CURRENT_PROJECT_VERSION="$SIGNLINK_BUILD_NUMBER" \
+              MARKETING_VERSION="$SIGNLINK_MARKETING_VERSION" \
+              | tee circleci-artifacts/xcode-build23-archive.log
+
+            cat > "$EXPORT_PLIST" <<'PLIST'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>method</key><string>app-store-connect</string>
+              <key>destination</key><string>export</string>
+              <key>signingStyle</key><string>automatic</string>
+              <key>teamID</key><string>TGBNH8WJV6</string>
+              <key>manageAppVersionAndBuildNumber</key><false/>
+            </dict>
+            </plist>
+            PLIST
+
+            mkdir -p "$EXPORT_DIR"
+            xcodebuild -exportArchive \
+              -archivePath "$ARCHIVE_PATH" \
+              -exportPath "$EXPORT_DIR" \
+              -exportOptionsPlist "$EXPORT_PLIST" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$KEY_PATH" \
+              -authenticationKeyID "$ASC_ADMIN_AB_KEY_ID" \
+              -authenticationKeyIssuerID "$ASC_ADMIN_AB_ISSUER_ID" \
+              | tee circleci-artifacts/xcode-build23-export.log
+
+            IPA_PATH="$(find "$EXPORT_DIR" -maxdepth 1 -name '*.ipa' -print -quit)"
+            test -n "$IPA_PATH" && test -f "$IPA_PATH"
+            mkdir -p circleci-artifacts/ipa-check
+            unzip -q "$IPA_PATH" -d circleci-artifacts/ipa-check
+            APP_PATH="$(find circleci-artifacts/ipa-check/Payload -maxdepth 1 -name '*.app' -print -quit)"
+            INFO_PLIST="$APP_PATH/Info.plist"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")" = "$SIGNLINK_BUNDLE_ID"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_PLIST")" = "$SIGNLINK_BUILD_NUMBER"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")" = "$SIGNLINK_MARKETING_VERSION"
+            codesign --verify --deep --strict "$APP_PATH"
+            shasum -a 256 "$IPA_PATH" | tee circleci-artifacts/build23-ipa-sha256.txt
+            echo "Signed Sign Link Version $SIGNLINK_MARKETING_VERSION / Build $SIGNLINK_BUILD_NUMBER IPA generated successfully."
+          no_output_timeout: 30m
+
+      - store_artifacts:
+          path: circleci-artifacts
+          destination: signlink-build23
+
 workflows:
   signlink-ci:
     jobs:
       - signlink-preflight
+      - signlink-build23-macos:
+          filters:
+            branches:
+              only: fix/build23-legal-back-navigation
