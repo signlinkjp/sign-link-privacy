@@ -1,0 +1,90 @@
+version: 2.1
+
+jobs:
+  signlink-preflight:
+    docker:
+      - image: cimg/node:22.20.0
+    resource_class: medium
+    steps:
+      - checkout
+
+      - run:
+          name: Install Bun
+          command: |
+            curl -fsSL https://bun.sh/install | bash
+            echo 'export BUN_INSTALL="$HOME/.bun"' >> "$BASH_ENV"
+            echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> "$BASH_ENV"
+            source "$BASH_ENV"
+            node --version
+            bun --version
+
+      - restore_cache:
+          keys:
+            - signlink-bun-v1-{{ checksum "bun.lock" }}
+            - signlink-bun-v1-
+
+      - run:
+          name: Install dependencies
+          command: bun install --frozen-lockfile
+
+      - save_cache:
+          key: signlink-bun-v1-{{ checksum "bun.lock" }}
+          paths:
+            - ~/.bun/install/cache
+
+      - run:
+          name: Environment contract
+          command: bun run check:env-contract
+
+      - run:
+          name: Typecheck
+          command: bun x tsc --noEmit
+
+      - run:
+          name: Test
+          command: node ./node_modules/vitest/vitest.mjs run
+          no_output_timeout: 20m
+
+      - run:
+          name: Production build
+          command: bun run build
+          no_output_timeout: 20m
+
+      - run:
+          name: Independent iOS release candidate
+          command: bun run release:ios:independent
+          no_output_timeout: 20m
+
+      - run:
+          name: Independent iOS release candidate source gate
+          command: RELEASE_CHANNEL=release bun run check:release-source
+
+      - run:
+          name: iOS configuration check
+          command: bun run check:ios-config
+
+      - run:
+          name: Release provenance development gate
+          command: bun run check:release-provenance
+
+      - run:
+          name: Release provenance release gate
+          command: |
+            GIT_SHA="$CIRCLE_SHA1" RELEASE_CHANNEL=release bun run provenance:write
+            RELEASE_CHANNEL=release bun run check:release-provenance
+
+      - run:
+          name: HEAD matches origin/main when building main
+          command: |
+            if [ "$CIRCLE_BRANCH" = "main" ]; then
+              git fetch origin main --quiet
+              test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+                echo "HEAD does not match origin/main"
+                exit 1
+              }
+            fi
+
+workflows:
+  signlink-ci:
+    jobs:
+      - signlink-preflight
